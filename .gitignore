@@ -1,0 +1,16 @@
+### **.gitignore**
+**Path:** `.gitignore`
+**Purpose:** This tells GitHub to **ignore** your private files so they never get uploaded to the internet by accident.
+
+# Ignore the environment variables file
+.env
+
+# Ignore the Telegram session file created by the script
+*.session
+
+# Ignore Python cache folders
+__pycache__/
+*.py[cod]
+
+# Ignore log files
+*.log

@@ -1,28 +1,27 @@
-"""
-CONFIG.PY - The Central Control Panel
-Fill in your API keys and Account details below.
-"""
+import os
+from dotenv import load_dotenv
 
-# 1. TELEGRAM API CREDENTIALS (from my.telegram.org)
-TELEGRAM_API_ID = 12345678  # <--- REPLACE WITH YOUR API ID
-TELEGRAM_API_HASH = 'your_api_hash_here'  # <--- REPLACE WITH YOUR API HASH
-# The username or ID of the channel you want to listen to (e.g., 'XAUUSD_Signals')
-SIGNAL_CHANNEL_ID = 'channel_username_or_id' 
+# Load the variables from the .env file
+load_dotenv()
 
-# 2. OPENAI API CREDENTIALS (for the CrewAI 'Brain')
-OPENAI_API_KEY = 'sk-proj-xxxxxxxxxxxxxxxxxxxx' # <--- REPLACE WITH YOUR OPENAI KEY
+# --- TELEGRAM API CREDENTIALS ---
+TELEGRAM_API_ID = int(os.getenv('TELEGRAM_API_ID', 0))
+TELEGRAM_API_HASH = os.getenv('TELEGRAM_API_HASH')
+SIGNAL_CHANNEL_ID = os.getenv('SIGNAL_CHANNEL_ID')
+
+# --- OPENAI API CREDENTIALS ---
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 OPENAI_MODEL = "gpt-4o-mini"
 
-# 3. METATRADER 5 ACCOUNT DETAILS
-MT5_LOGIN = 12345678  # <--- YOUR MT5 ACCOUNT NUMBER
-MT5_PASSWORD = 'your_mt5_password'  # <--- YOUR MT5 PASSWORD
-MT5_SERVER = 'Broker-ServerName'  # <--- YOUR BROKER SERVER (e.g., 'ICMarkets-Demo')
-MT5_PATH = r"C:\Program Files\MetaTrader 5\terminal64.exe" # Path to your MT5 terminal
+# --- VANTAGE (METATRADER 5) CREDENTIALS ---
+MT5_LOGIN = int(os.getenv('MT5_LOGIN', 0))
+MT5_PASSWORD = os.getenv('MT5_PASSWORD')
+MT5_SERVER = os.getenv('MT5_SERVER')
+MT5_PATH = os.getenv('MT5_PATH')
 
-# 4. RISK MANAGEMENT SETTINGS (Based on your Schema)
-MAX_RISK_PER_TRADE_PERCENT = 5.0  # The bot will never risk more than 5% of balance
-USE_REPORTS = True  # Set to True to send Gain/Loss reports back to you on Telegram
+# --- RISK MANAGEMENT SETTINGS ---
+MAX_RISK_PER_TRADE_PERCENT = float(os.getenv('MAX_RISK_PERCENT', 2.0))
 
-# 5. ASSET CONFIGURATION (XAUUSD Example)
-# Gold contract size is usually 100. Adjust if your broker uses different sizing.
-XAUUSD_CONTRACT_SIZE = 100
+# --- ASSET SETTINGS ---
+# Default contract sizes (AI will attempt to verify these with the broker)
+DEFAULT_CONTRACT_SIZE = 100

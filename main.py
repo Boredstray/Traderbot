@@ -1,96 +1,120 @@
 """
-MAIN.PY - The Command Center
-This script connects to Telegram and coordinates the AI Agents and MT5.
-Run this file to start the bot.
+MAIN.PY - The Unified Command Center (Vantage Edition)
+Connects Telegram -> AI Agents -> Vantage MT5
 """
 
 import asyncio
 from telethon import TelegramClient, events
 import config
 import trading_engine
+import MetaTrader5 as mt5
 
-# 1. INITIALIZE TELEGRAM CLIENT
-# This uses your API ID and Hash from config.py to log in as 'your' account
-client = TelegramClient('trading_session', config.TELEGRAM_API_ID, config.TELEGRAM_API_HASH)
+# Initialize Telegram
+client = TelegramClient('vantage_session', config.TELEGRAM_API_ID, config.TELEGRAM_API_HASH)
 
-print("--- AI Trading Bot Starting ---")
+# Tracking dictionary for Break-Even and Monitoring
+active_trades = {}
 
-# 2. THE SIGNAL LISTENER
+print("--- Vantage AI Bot: Online & Listening ---")
+
 @client.on(events.NewMessage(chats=config.SIGNAL_CHANNEL_ID))
 async def signal_handler(event):
     raw_text = event.raw_text
-    print(f"\n[New Message Received]:\n{raw_text}")
+    
+    # 1. TRIGGER LOGIC: Recognize signals even without 'SIGNAL ALERT' (Obj 1 & 3)
+    trigger_keywords = ['SIGNAL ALERT', 'XAUUSD', 'BUY', 'SELL', 'ENTRY', 'TP', 'SL']
+    is_potential_signal = any(key in raw_text.upper() for key in trigger_keywords)
 
-    # Pattern Matching: Check for keywords defined in your Schema
-    keywords = ['SIGNAL ALERT', 'XAUUSD', 'BUY', 'SELL', 'TP', 'SL']
-    if any(key in raw_text.upper() for key in keywords):
-        print(">>> Signal detected! Initiating AI Analysis...")
+    if is_potential_signal:
+        print("\n[!] Signal detected. Analyzing...")
         
         try:
-            # Step A: Run the CrewAI Agents to parse and calculate risk
-            # This returns a result like: ["XAUUSD", "BUY", 2050.0, 2060.0, 2040.0]
-            ai_result = trading_engine.run_trading_crew(raw_text)
-            print(f"AI Analysis Complete: {ai_result}")
+            # 2. AI PARSING & NORMALIZATION (Obj 3)
+            # Extracts: [SYMBOL, ACTION, ENTRY, TP1, TP2, TP3, SL]
+            ai_raw = trading_engine.run_trading_crew(raw_text)
+            data = eval(str(ai_raw)) 
+            raw_sym, action, entry, tp1, tp2, tp3, raw_sl = data
 
-            # Step B: Perform Technical Analysis (RSI/MACD)
-            # This fulfills Objective 2 of your Schema
-            analysis = trading_engine.get_analysis_data("XAUUSD")
-            print(f"Technical Filter: {analysis}")
+            # 3. VANTAGE ASSET CROSS-REFERENCING (Obj 3)
+            symbol = trading_engine.get_vantage_symbol(raw_sym)
+            if not symbol:
+                print(f"Error: Asset {raw_sym} not found on Vantage.")
+                return
 
-            # Step C: Human-in-the-loop (Safety Switch)
-            # To automate fully, remove the input() and 'if' check below.
-            print("\nPROPOSED TRADE:")
-            print(f"Details: {ai_result}")
-            print(f"Market Sentiment: {analysis}")
+            # 4. SPREAD & RISK CALCULATION (Obj 4)
+            # Adds spread to SL and enforces 2% risk limit.
+            lot, adj_sl = trading_engine.calculate_risk_and_spread(symbol, entry, raw_sl, action)
+
+            # 5. EXECUTION & REPORTING (Obj 1)
+            response = trading_engine.execute_vantage_trade(symbol, action, lot, tp1, adj_sl)
             
-            confirm = input("Confirm execution on MT5? (y/n): ")
-            
-            if confirm.lower() == 'y':
-                # Parse the AI result (simple string split for this example)
-                # In a production bot, we'd use a more robust JSON parser
-                # For now, let's assume the AI outputs: Symbol, Action, Entry, TP, SL
-                # Example: "XAUUSD, BUY, 2350.0, 2360.0, 2340.0"
-                parts = str(ai_result).replace('[','').replace(']','').split(',')
-                symbol = parts[0].strip()
-                action = parts[1].strip()
-                entry = float(parts[2].strip())
-                tp = float(parts[3].strip())
-                sl = float(parts[4].strip())
-
-                # Step D: Calculate 5% Lot Size
-                lot = trading_engine.calculate_lot_size(symbol, entry, sl)
+            if response and response.retcode == mt5.TRADE_RETCODE_DONE:
+                ticket = response.order
+                active_trades[ticket] = {
+                    "entry": entry, "tp1": tp1, "symbol": symbol, "action": action.upper(), "be_moved": False
+                }
                 
-                # Step E: Execute Trade
-                execution_status = trading_engine.execute_mt5_trade(symbol, action, lot, tp, sl)
-                print(execution_status)
-                
-                # Report back to you on Telegram
-                await client.send_message('me', f"🚀 Bot Executed Trade: {execution_status}")
+                # Send the signal used to trade back to you in your requested format
+                summary = (
+                    f"✅ **TRADE EXECUTED**\n\n"
+                    f"SIGNAL ALERT\n\n"
+                    f"{action.upper()} {symbol} {entry}\n"
+                    f"TP1: {tp1}\n"
+                    f"TP2: {tp2}\n"
+                    f"TP3: {tp3}\n"
+                    f"🔴SL: {adj_sl}\n"
+                    f"(Lot: {lot})"
+                )
+                await client.send_message('me', summary)
+            else:
+                print(f"Trade Rejected: {response.comment if response else 'Connection Error'}")
 
         except Exception as e:
-            print(f"Critical Error processing signal: {e}")
-            await client.send_message('me', f"⚠️ Bot Error: {e}")
+            print(f"Parsing Error: {e}")
 
-# 3. THE LOOP-BACK REPORTER (Objective 5)
-async def report_results_loop():
-    """Background task to check for closed trades and report GAIN/LOSS."""
+async def monitoring_loop():
+    """
+    WATCHDOG: Monitors TP1 for Break-Even and reports PROFIT/LOSS (Obj 5).
+    """
     while True:
-        await asyncio.sleep(300) # Check every 5 minutes
-        result = trading_engine.check_recent_results()
-        if "GAIN" in result or "LOSS" in result:
-            print(f"[Loop-back]: {result}")
-            await client.send_message('me', f"📊 {result}")
+        await asyncio.sleep(15) # Check every 15 seconds
+        
+        # Part A: Check for closed trades (Loop-back Profit/Loss)
+        report = trading_engine.get_detailed_report()
+        if report:
+            msg = (f"📊 **{report['status']} REPORT**\n"
+                   f"Asset: {report['symbol']}\n"
+                   f"Profit: ${report['profit']}\n"
+                   f"New Balance: ${report['balance']}")
+            await client.send_message('me', msg)
 
-# 4. START THE BOT
+        # Part B: Move SL to Break-Even if TP1 hit
+        if not active_trades: continue
+        
+        trading_engine.initialize_mt5()
+        for ticket in list(active_trades.keys()):
+            info = active_trades[ticket]
+            pos = mt5.positions_get(ticket=ticket)
+            
+            if not pos:
+                active_trades.pop(ticket) # Position closed by broker
+                continue
+            
+            # Check if TP1 reached to move SL to Entry
+            tick = mt5.symbol_info_tick(info['symbol'])
+            price = tick.bid if info['action'] == "BUY" else tick.ask
+            tp1_hit = (price >= info['tp1']) if info['action'] == "BUY" else (price <= info['tp1'])
+            
+            if tp1_hit and not info['be_moved']:
+                res = trading_engine.move_to_break_even(ticket, info['entry'])
+                if res.retcode == mt5.TRADE_RETCODE_DONE:
+                    info['be_moved'] = True
+                    await client.send_message('me', f"🛡️ **BREAK-EVEN**: SL moved to {info['entry']} for {info['symbol']}")
+
 async def main():
     await client.start()
-    print("Bot is now listening to Telegram...")
-    
-    # Run the listener and the result reporter simultaneously
-    await asyncio.gather(
-        client.run_until_disconnected(),
-        report_results_loop()
-    )
+    print("Bot is listening...")
+    await asyncio.gather(client.run_until_disconnected(), monitoring_loop())
 
 if __name__ == "__main__":
     asyncio.run(main())

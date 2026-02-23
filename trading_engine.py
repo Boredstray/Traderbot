@@ -5,98 +5,115 @@ from crewai import Agent, Task, Crew, Process
 from langchain_openai import ChatOpenAI
 import config
 import time
+from datetime import datetime, timedelta
 
-# 1. INITIALIZE THE BRAIN (OpenAI)
-llm = ChatOpenAI(
-    model=config.OPENAI_MODEL,
-    api_key=config.OPENAI_API_KEY
-)
+# 1. INITIALIZE AI
+llm = ChatOpenAI(model=config.OPENAI_MODEL, api_key=config.OPENAI_API_KEY)
 
 def initialize_mt5():
-    """Connects to the MT5 terminal using credentials from config.py"""
     if not mt5.initialize(path=config.MT5_PATH):
-        print(f"MT5 Initialize failed, error code: {mt5.last_error()}")
         return False
-    
-    authorized = mt5.login(
-        login=config.MT5_LOGIN, 
-        password=config.MT5_PASSWORD, 
-        server=config.MT5_SERVER
-    )
-    if not authorized:
-        print(f"MT5 Login failed, error code: {mt5.last_error()}")
-    return authorized
+    return mt5.login(login=config.MT5_LOGIN, password=config.MT5_PASSWORD, server=config.MT5_SERVER)
 
-def get_analysis_data(symbol):
-    """Pulls recent market data to check RSI and MACD."""
-    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_H1, 0, 100)
-    if rates is None: return "Unknown"
-    
-    df = pd.DataFrame(rates)
-    df['rsi'] = ta.rsi(df['close'], length=14)
-    macd = ta.macd(df['close'])
-    
-    current_rsi = df['rsi'].iloc[-1]
-    return f"RSI is {current_rsi:.2f}. MACD is showing trend strength."
+def get_vantage_symbol(raw_symbol):
+    """Cross-references symbol with Vantage (e.g. AUDCAD-ECN -> AUDCAD)."""
+    initialize_mt5()
+    clean_symbol = raw_symbol.split('-')[0].split('.')[0].upper()
+    symbol_info = mt5.symbol_info(clean_symbol)
+    if symbol_info is None:
+        all_symbols = [s.name for s in mt5.symbols_get()]
+        for s in all_symbols:
+            if clean_symbol in s: return s
+        return None
+    return clean_symbol
 
-def calculate_lot_size(symbol, entry, stop_loss):
-    """Calculates lot size to ensure exactly 5% risk per your schema."""
-    account_info = mt5.account_info()
-    if account_info is None: return 0.01
+def calculate_risk_and_spread(symbol, entry, sl, action):
+    """Adds broker spread to SL and enforces 2% risk limit."""
+    info = mt5.symbol_info(symbol)
+    if info is None: return 0.01, sl
     
-    balance = account_info.balance
-    risk_amount = balance * (config.MAX_RISK_PER_TRADE_PERCENT / 100)
+    spread_points = info.spread * info.point
+    adjusted_sl = sl - spread_points if action.upper() == "BUY" else sl + spread_points
     
-    # Distance in points
-    sl_distance = abs(entry - stop_loss)
-    if sl_distance == 0: return 0.01
+    account = mt5.account_info()
+    risk_amount = account.balance * (config.MAX_RISK_PER_TRADE_PERCENT / 100)
+    sl_dist = abs(entry - adjusted_sl)
     
-    # Lot Calculation for XAUUSD (assuming 100 contract size)
-    # Formula: Risk / (SL Distance * Contract Size)
-    lot_size = risk_amount / (sl_distance * config.XAUUSD_CONTRACT_SIZE)
+    if sl_dist == 0: return 0.01, adjusted_sl
     
-    # Round to 2 decimal places and ensure it's not 0
-    return max(0.01, round(lot_size, 2))
+    # Lot calculation: Risk / (Distance * Contract Value)
+    # Note: 100 is standard for Gold, 100,000 for Forex. 
+    contract_size = 100 if "XAU" in symbol or "GOLD" in symbol.upper() else 100000
+    lot = risk_amount / (sl_dist * contract_size)
+    
+    return max(0.01, round(lot, 2)), adjusted_sl
 
-# 2. DEFINE THE AI CREW (Agents & Tasks)
+def get_detailed_report():
+    """
+    OBJECTIVE 5: The Loop-back.
+    Checks history for closed trades and reports PROFIT/LOSS + Balance.
+    """
+    if not initialize_mt5(): return None
+    
+    # Check trades closed in the last 15 minutes
+    from_date = datetime.now() - timedelta(minutes=15)
+    history = mt5.history_deals_get(from_date, datetime.now())
+    
+    if history and len(history) > 0:
+        # Get the most recent closing deal
+        deal = history[-1]
+        
+        # Determine if it was a Profit or Loss based on the 'reason' and profit amount
+        # mt5.DEAL_REASON_TP (Take Profit) or mt5.DEAL_REASON_SL (Stop Loss)
+        status = "PROFIT 🟢" if deal.profit > 0 else "LOSS 🔴"
+        
+        # Fetch current balance after the trade
+        account_info = mt5.account_info()
+        new_balance = account_info.balance if account_info else "Unknown"
+        
+        report = {
+            "symbol": deal.symbol,
+            "status": status,
+            "profit": round(deal.profit, 2),
+            "balance": round(new_balance, 2)
+        }
+        return report
+    return None
+
+def move_to_break_even(ticket, entry_price):
+    """Moves SL to entry price to protect profit."""
+    request = {
+        "action": mt5.TRADE_ACTION_SLTP,
+        "symbol": mt5.positions_get(ticket=ticket)[0].symbol,
+        "sl": entry_price,
+        "position": ticket,
+    }
+    return mt5.order_send(request)
+
+# --- AI AGENTS ---
 parser_agent = Agent(
-    role='Signal Parser',
-    goal='Extract Asset, Action, Entry, TP, and SL from raw text.',
-    backstory='You are a master at reading messy Telegram signals and turning them into clean data.',
+    role='Expert Signal Analyst',
+    goal='Extract exact trade data and normalize symbols for Vantage.',
+    backstory='You identify signals from raw text, extracting Entry, TPs, and SL accurately.',
     llm=llm
 )
 
-risk_agent = Agent(
-    role='Risk Manager',
-    goal='Verify the trade is safe and calculate the precise lot size.',
-    backstory='You are a conservative math expert. You never allow more than 5% risk.',
-    llm=llm
-)
-
-def run_trading_crew(raw_signal_text):
-    """The main AI process that handles the signal."""
+def run_trading_crew(raw_text):
     parse_task = Task(
-        description=f"Parse this signal: {raw_signal_text}. Identify Symbol, Action (BUY/SELL), Entry, TP, and SL.",
-        expected_output="A JSON-style list: [SYMBOL, ACTION, ENTRY, TP, SL]",
+        description=f"Analyze this signal text: {raw_text}. Identify Symbol, Action, Entry, TP1, TP2, TP3, and SL.",
+        expected_output="JSON list: [SYMBOL, ACTION, ENTRY, TP1, TP2, TP3, SL]",
         agent=parser_agent
     )
-    
-    trading_crew = Crew(
-        agents=[parser_agent, risk_agent],
-        tasks=[parse_task],
-        process=Process.sequential
-    )
-    
-    result = trading_crew.kickoff()
-    return result
+    return Crew(agents=[parser_agent], tasks=[parse_task]).kickoff()
 
-def execute_mt5_trade(symbol, action, lot, tp, sl):
-    """Sends the actual trade to the broker."""
-    if not initialize_mt5(): return "MT5 Connection Error"
+def execute_vantage_trade(symbol, action, lot, tp, sl):
+    """Places the trade on Vantage MT5."""
+    if not initialize_mt5(): return None
+    mt5.symbol_select(symbol, True)
     
-    # Determine trade type
     trade_type = mt5.ORDER_TYPE_BUY if action.upper() == "BUY" else mt5.ORDER_TYPE_SELL
-    price = mt5.symbol_info_tick(symbol).ask if action.upper() == "BUY" else mt5.symbol_info_tick(symbol).bid
+    tick = mt5.symbol_info_tick(symbol)
+    price = tick.ask if action.upper() == "BUY" else tick.bid
     
     request = {
         "action": mt5.TRADE_ACTION_DEAL,
@@ -107,28 +124,8 @@ def execute_mt5_trade(symbol, action, lot, tp, sl):
         "sl": sl,
         "tp": tp,
         "magic": 123456,
-        "comment": "AI Bot Trade",
+        "comment": "Vantage AI Bot",
         "type_time": mt5.ORDER_TIME_GTC,
         "type_filling": mt5.ORDER_FILLING_IOC,
     }
-    
-    result = mt5.order_send(request)
-    if result.retcode != mt5.TRADE_RETCODE_DONE:
-        return f"Trade Failed: {result.comment}"
-    return f"Trade SUCCESS! {action} {lot} lots of {symbol} at {price}."
-
-# 3. PROFIT/LOSS TRACKING (Loop-back)
-def check_recent_results():
-    """Checks closed trades to report Gain/Loss."""
-    if not initialize_mt5(): return "No Connection"
-    
-    # Look at deals in the last 24 hours
-    from_date = time.time() - (24 * 3600)
-    history = mt5.history_deals_get(from_date, time.time())
-    
-    if history:
-        last_deal = history[-1]
-        profit = last_deal.profit
-        status = "GAIN" if profit > 0 else "LOSS"
-        return f"Recent Trade Result: {status} ({profit} USD)"
-    return "No new closed trades."
+    return mt5.order_send(request)
