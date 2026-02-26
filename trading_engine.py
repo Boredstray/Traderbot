@@ -1,3 +1,4 @@
+from pocket_option import PocketOptionClient
 import MetaTrader5 as mt5
 import pandas as pd
 import pandas_ta as ta
@@ -6,7 +7,6 @@ import asyncio
 from datetime import datetime, timedelta # FIXED: Added for time-based reporting
 from crewai import Agent, Task, Crew
 from langchain_openai import ChatOpenAI
-from pocket_option import PocketOptionClient 
 import config
 
 # --- 1. INITIALIZATION & AI SETUP ---
@@ -17,6 +17,22 @@ def initialize_mt5():
     if not mt5.initialize(path=config.MT5_PATH):
         return False
     return mt5.login(login=config.MT5_LOGIN, password=config.MT5_PASSWORD, server=config.MT5_SERVER)
+
+async def execute_pocket_option_trade(data):
+    """Binary Execution Engine using Pocket Option Client."""
+    client = PocketOptionClient(config.POCKET_OPTION_SSID)
+    try:
+        await client.connect()
+        direction = "CALL" if data['action'].upper() in ["BUY", "CALL"] else "PUT"
+        result = await client.place_order(
+            asset=data['symbol'],
+            amount=config.BINARY_TRADE_AMOUNT,
+            direction=direction,
+            duration=int(data.get('expiry', 5)) * 60
+        )
+        return result
+    except Exception as e:
+        return f"Binary Error: {e}"
 
 # --- 2. AI ROUTING & PARSING ---
 parser_agent = Agent(
@@ -97,22 +113,6 @@ def execute_vantage_trade(symbol, action, lot, tp, sl):
         "type_filling": mt5.ORDER_FILLING_IOC,
     }
     return mt5.order_send(request)
-
-async def execute_pocket_option_trade(data):
-    """Binary Execution Engine using Pocket Option Client."""
-    client = PocketOptionClient(ssid=config.POCKET_OPTION_SSID)
-    try:
-        await client.connect()
-        direction = "CALL" if data['action'] == "BUY" else "PUT"
-        result = await client.place_order(
-            asset=data['symbol'],
-            amount=config.BINARY_TRADE_AMOUNT,
-            direction=direction,
-            duration=int(data.get('expiry', 5)) * 60
-        )
-        return result
-    except Exception as e:
-        return f"Binary Error: {e}"
 
 # --- 5. MONITORING & REPORTING ---
 def get_detailed_report():
