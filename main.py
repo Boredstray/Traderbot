@@ -8,6 +8,7 @@ import json
 from telethon import TelegramClient, events
 import config
 import trading_engine
+import persistence
 import MetaTrader5 as mt5
 
 # 1. INITIALIZE CLIENTS
@@ -15,19 +16,21 @@ import MetaTrader5 as mt5
 client = TelegramClient('vantage_session', config.TELEGRAM_API_ID, config.TELEGRAM_API_HASH)
 
 # Tracking for Forex trades (Break-Even and Monitoring)
-active_trades = {}
+# Load persisted trades on startup
+active_trades = persistence.load_active_trades()
 
 print("--- POWERHOUSE BOT: ONLINE & LISTENING ---")
 print(f"Monitoring Channels: {config.SIGNAL_CHANNEL_ID}")
+persistence.logger.info(f"Bot started with {len(active_trades)} active trades loaded")
 
 @client.on(events.NewMessage(chats=config.SIGNAL_CHANNEL_ID))
 async def signal_handler(event):
-    raw_text = event.raw_text
+    raw_text = event.raw_text.upper()
     trigger_keywords = ['SIGNAL ALERT', 'XAUUSD', 'BUY', 'SELL', 'ENTRY', 'TP', 'SL', 'EXPIRATION', 'PUT', 'CALL']
     is_potential_signal = any(key in raw_text.upper() for key in trigger_keywords)
 
     if is_potential_signal:
-        print("\n[!] Signal detected. Routing to AI Parser...")
+        print(f"\n[🔍] Potential Signal Detected: '{raw_text[:30]}...' Routing to AI Parser...")
         
         try:
             # 1. AI PARSING - Returns a dictionary with 'type', 'symbol', 'action', etc.
@@ -72,9 +75,14 @@ async def signal_handler(event):
                         "entry": data['entry'], "tp1": data['tp1'], 
                         "symbol": symbol, "action": data['action'].upper(), "be_moved": False
                     }
+                    # Save to persistence file
+                    persistence.save_active_trades(active_trades)
+                    persistence.log_trade_execution("FOREX", symbol, data['action'], "SUCCESS")
                     await client.send_message('me', f"✅ **FOREX TRADE EXECUTED**: {symbol} {data['action']}")
                 else:
-                    print(f"Vantage Rejected: {response.comment if response else 'Error'}")
+                    error_msg = response.comment if response else 'Error'
+                    print(f"Vantage Rejected: {error_msg}")
+                    persistence.log_error("Vantage Rejection", error_msg)
 
         except Exception as e:
             print(f"Execution Error: {e}")
@@ -86,9 +94,12 @@ async def monitoring_loop():
     """
     while True:
         await asyncio.sleep(15) 
-        
         # Check for closed trades (Reporting)
+        # Prevent Vantage from popping up if no Forex trades are running
+        if not active_trades:
+            continue
         report = trading_engine.get_detailed_report()
+        
         if report:
             msg = (f"📊 **{report['status']} REPORT**\n"
                    f"Asset: {report['symbol']}\n"
@@ -106,6 +117,12 @@ async def monitoring_loop():
             
             if not pos:
                 active_trades.pop(ticket) # Position closed
+                # Save to persistence after trade is closed
+                persistence.save_active_trades(active_trades)
+                persistence.logger.info(f"📌 Trade closed: Ticket {ticket}")
+                # Clear persistence file if no more active trades
+                if not active_trades:
+                    persistence.clear_active_trades()
                 continue
             
             # Check TP1 to move SL to Entry (Retained logic)
