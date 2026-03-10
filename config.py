@@ -21,6 +21,7 @@ MT5_SERVER = os.getenv('MT5_SERVER', "")
 MT5_PATH = os.getenv('MT5_PATH', "")
 
 POCKET_OPTION_SSID = os.getenv('POCKET_OPTION_SSID', "")
+POCKET_OPTION_PATH = os.getenv('POCKET_OPTION_PATH', "")
 BINARY_TRADE_AMOUNT = 10 # Default amount for binary trades
 
 MAX_RISK_PER_TRADE_PERCENT = float(os.getenv('MAX_RISK_PERCENT', 2.0))

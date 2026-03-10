@@ -23,68 +23,62 @@ print(f"Monitoring Channels: {config.SIGNAL_CHANNEL_ID}")
 @client.on(events.NewMessage(chats=config.SIGNAL_CHANNEL_ID))
 async def signal_handler(event):
     raw_text = event.raw_text
-    
-    # TRIGGER LOGIC: Identify if this looks like a trade signal (Forex or Binary)
-    keywords = ['SIGNAL', 'BUY', 'SELL', 'PUT', 'CALL', 'TP', 'SL', 'EXPIRATION', 'OTC']
-    if not any(key in raw_text.upper() for key in keywords):
-        return
+    trigger_keywords = ['SIGNAL ALERT', 'XAUUSD', 'BUY', 'SELL', 'ENTRY', 'TP', 'SL', 'EXPIRATION', 'PUT', 'CALL']
+    is_potential_signal = any(key in raw_text.upper() for key in trigger_keywords)
 
-    print("\n[!] Signal detected. Routing to AI Parser...")
-    
-    try:
-        # 2. AI PARSING & ROUTING
-        # Now returns a dict with 'type' (FOREX/BINARY) and specific data
-        data = trading_engine.run_trading_crew(raw_text)
+    if is_potential_signal:
+        print("\n[!] Signal detected. Routing to AI Parser...")
         
-        # --- PATH A: FOREX (VANTAGE MT5) ---
-        if data.get('type') == 'FOREX':
-            symbol = trading_engine.get_vantage_symbol(data['symbol'])
-            if not symbol:
-                await client.send_message('me', f"❌ Error: Asset {data['symbol']} not found on Vantage.")
-                return
-
-            # Risk calculation (Now using your revised 2% limit)
-            lot, adj_sl = trading_engine.calculate_risk_and_spread(
-                symbol, data['entry'], data['sl'], data['action']
-            )
-
-            response = trading_engine.execute_vantage_trade(
-                symbol, data['action'], lot, data['tp1'], adj_sl
-            )
+        try:
+            # 1. AI PARSING - Returns a dictionary with 'type', 'symbol', 'action', etc.
+            data = trading_engine.run_trading_crew(raw_text)
             
-            if response and response.retcode == mt5.TRADE_RETCODE_DONE:
-                active_trades[response.order] = {
-                    "entry": data['entry'], "tp1": data['tp1'], 
-                    "symbol": symbol, "action": data['action'].upper(), "be_moved": False
-                }
+            # --- PATH A: BINARY OPTIONS (Pocket Option) ---
+            if data.get('type') == 'BINARY':
+                print("[!] Binary Signal Identified. Executing on Pocket Option...")
+                # Note: We do NOT call Vantage functions here to prevent it from opening
+                response = await trading_engine.execute_pocket_option_trade(data)
+                
                 summary = (
-                    f"✅ **FOREX TRADE EXECUTED**\n\n"
-                    f"{data['action'].upper()} {symbol} @ {data['entry']}\n"
-                    f"TP1: {data['tp1']} | TP2: {data.get('tp2', 'N/A')}\n"
-                    f"🔴 SL: {adj_sl} (Lot: {lot})"
+                    f"🎯 **BINARY TRADE PLACED**\n\n"
+                    f"Asset: {data['symbol']}\n"
+                    f"Action: {data['action'].upper()}\n"
+                    f"Expiry: {data.get('expiry', '5')} mins\n"
+                    f"Gale: {data.get('gale_steps', '0')} steps detected"
+                    f"Status: {response}"
                 )
                 await client.send_message('me', summary)
+
+            # --- PATH B: FOREX (Vantage MT5) ---
             else:
-                error_msg = response.comment if response else "Connection Error"
-                await client.send_message('me', f"❌ MT5 Rejected: {error_msg}")
+                print("[!] Forex Signal Identified. Executing on Vantage...")
+                symbol = trading_engine.get_vantage_symbol(data['symbol'])
+                if not symbol:
+                    print(f"Error: Asset {data['symbol']} not found on Vantage.")
+                    return
 
-        # --- PATH B: BINARY (POCKET OPTION) ---
-        elif data.get('type') == 'BINARY':
-            # Execute on Pocket Option (Binary Engine handles the Websocket)
-            res = await trading_engine.execute_pocket_option_trade(data)
-            
-            summary = (
-                f"🔥 **BINARY TRADE PLACED**\n\n"
-                f"Asset: {data['symbol']}\n"
-                f"Action: {data['action'].upper()}\n"
-                f"Expiry: {data.get('expiry', '5')} mins\n"
-                f"Gale: {data.get('gale_steps', '0')} steps detected"
-            )
-            await client.send_message('me', summary)
+                # Only initialize and calculate risk for Forex trades
+                lot, adj_sl = trading_engine.calculate_risk_and_spread(
+                    symbol, data['entry'], data['sl'], data['action']
+                )
 
-    except Exception as e:
-        print(f"Routing Error: {e}")
-        await client.send_message('me', f"⚠️ Parser Error: {str(e)}")
+                response = trading_engine.execute_vantage_trade(
+                    symbol, data['action'], lot, data['tp1'], adj_sl
+                )
+                
+                if response and response.retcode == mt5.TRADE_RETCODE_DONE:
+                    # (Existing Vantage tracking logic for Break-Even)
+                    active_trades[response.order] = {
+                        "entry": data['entry'], "tp1": data['tp1'], 
+                        "symbol": symbol, "action": data['action'].upper(), "be_moved": False
+                    }
+                    await client.send_message('me', f"✅ **FOREX TRADE EXECUTED**: {symbol} {data['action']}")
+                else:
+                    print(f"Vantage Rejected: {response.comment if response else 'Error'}")
+
+        except Exception as e:
+            print(f"Execution Error: {e}")
+            await client.send_message('me', f"⚠️ **Execution Error**: {str(e)}")
 
 async def monitoring_loop():
     """
